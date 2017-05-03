@@ -284,6 +284,25 @@ class FramingSpec extends StreamSpec {
       ex.getMessage should ===("Decoded frame header reported negative size -4")
     }
 
+    "fail the stage on computeFrameSize values less than minimum chunk size" in {
+      implicit val bo = java.nio.ByteOrder.LITTLE_ENDIAN
+
+      def computeFrameSize(arr: Array[Byte], l: Int): Int = 3
+
+      // A 4-byte message containing only an Int specifying the length of the payload
+      val bs = ByteString.newBuilder.putInt(4).result()
+
+      val res =
+        Source
+          .single(bs)
+          .via(Flow[ByteString].via(Framing.lengthField(4, 0, 1000, bo, computeFrameSize)))
+          .runWith(Sink.seq)
+
+      val ex = res.failed.futureValue
+      ex shouldBe a[FramingException]
+      ex.getMessage should ===("Computed frame size 3 is less than minimum chunk size 4")
+    }
+
     "let zero length field values pass through (#22367)" in {
       implicit val bo = java.nio.ByteOrder.LITTLE_ENDIAN
 
