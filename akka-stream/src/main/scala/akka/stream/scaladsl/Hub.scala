@@ -13,6 +13,11 @@ import akka.stream.stage._
 import scala.annotation.tailrec
 import scala.concurrent.{ Future, Promise }
 import scala.util.{ Failure, Success, Try }
+import java.util.Arrays
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReferenceArray
+import scala.collection.mutable.LongMap
 
 /**
  * A MergeHub is a special streaming hub that is able to collect streamed elements from a dynamic set of
@@ -107,8 +112,7 @@ private[akka] class MergeHub[T](perProducerBufferSize: Int) extends GraphStageWi
     private[this] val demands = scala.collection.mutable.LongMap.empty[InputState]
     private[this] val wakeupCallback = getAsyncCallback[NotUsed]((_) ⇒
       // We are only allowed to dequeue if we are not backpressured. See comment in tryProcessNext() for details.
-      if (isAvailable(out)) tryProcessNext(firstAttempt = true)
-    )
+      if (isAvailable(out)) tryProcessNext(firstAttempt = true))
 
     setHandler(out, this)
 
@@ -683,6 +687,388 @@ private[akka] class BroadcastHub[T](bufferSize: Int) extends GraphStageWithMater
             offsetInitialized = true
             previousPublishedOffset = initialOffset
             offset = initialOffset
+            if (isAvailable(out) && (hubCallback ne null)) onPull()
+        }
+
+        setHandler(out, this)
+      }
+    }
+
+    (logic, Source.fromGraph(source))
+  }
+}
+
+/**
+ * FIXME write docs
+ *
+ * A BroadcastHub is a special streaming hub that is able to broadcast streamed elements to a dynamic set of consumers.
+ * It consists of two parts, a [[Sink]] and a [[Source]]. The [[Sink]] broadcasts elements from a producer to the
+ * actually live consumers it has. Once the producer has been materialized, the [[Sink]] it feeds into returns a
+ * materialized value which is the corresponding [[Source]]. This [[Source]] can be materialized an arbitrary number
+ * of times, where each of the new materializations will receive their elements from the original [[Sink]].
+ */
+object PartitionHub {
+
+  /**
+   * FIXME write docs
+   *
+   * Creates a [[Sink]] that receives elements from its upstream producer and broadcasts them to a dynamic set
+   * of consumers. After the [[Sink]] returned by this method is materialized, it returns a [[Source]] as materialized
+   * value. This [[Source]] can be materialized an arbitrary number of times and each materialization will receive the
+   * broadcast elements form the ofiginal [[Sink]].
+   *
+   * Every new materialization of the [[Sink]] results in a new, independent hub, which materializes to its own
+   * [[Source]] for consuming the [[Sink]] of that materialization.
+   *
+   * If the original [[Sink]] is failed, then the failure is immediately propagated to all of its materialized
+   * [[Source]]s (possibly jumping over already buffered elements). If the original [[Sink]] is completed, then
+   * all corresponding [[Source]]s are completed. Both failure and normal completion is "remembered" and later
+   * materializations of the [[Source]] will see the same (failure or completion) state. [[Source]]s that are
+   * cancelled are simply removed from the dynamic set of consumers.
+   *
+   * @param bufferSize Buffer size used by the producer. Gives an upper bound on how "far" from each other two
+   *                   concurrent consumers can be in terms of element. If this buffer is full, the producer
+   *                   is backpressured. Must be a power of two and less than 4096.
+   */
+  def sink[T](partitioner: T ⇒ Int, startAfterNbrOfStreams: Int, bufferSize: Int = 256): Sink[T, Source[T, NotUsed]] =
+    Sink.fromGraph(new PartitionHub[T](partitioner, startAfterNbrOfStreams, bufferSize))
+
+  private val FixedQueues = 128
+
+  private class PartitionQueue {
+    // FIXME evaluate if immutable.Queue (or something else?) is better than Vector
+    private val queues1 = new AtomicReferenceArray[Vector[Any]](FixedQueues)
+    private val queues2 = new ConcurrentHashMap[Long, Vector[Any]]
+    private val _size = new AtomicInteger
+
+    def init(id: Long): Unit = {
+      if (id < FixedQueues)
+        queues1.set(id.toInt, Vector.empty)
+      else
+        queues2.put(id, Vector.empty)
+    }
+
+    def size: Int = _size.get
+
+    def isEmpty(id: Long): Boolean = {
+      val queue =
+        if (id < FixedQueues) queues1.get(id.toInt)
+        else queues2.get(id)
+      queue.isEmpty
+    }
+
+    def nonEmpty(id: Long): Boolean = !isEmpty(id)
+
+    def offer(id: Long, elem: Any): Unit = {
+      @tailrec def offer1(): Unit = {
+        val i = id.toInt
+        val queue = queues1.get(i)
+        if (queues1.compareAndSet(i, queue, queue :+ elem))
+          _size.incrementAndGet()
+        else
+          offer1() // CAS failed, retry
+      }
+
+      @tailrec def offer2(): Unit = {
+        val queue = queues2.get(id)
+        if (queues2.replace(id, queue, queue :+ elem)) {
+          _size.incrementAndGet()
+        } else
+          offer2() // CAS failed, retry
+      }
+
+      if (id < FixedQueues) offer1() else offer2()
+    }
+
+    def poll(id: Long): AnyRef = {
+      @tailrec def poll1(): AnyRef = {
+        val i = id.toInt
+        val queue = queues1.get(i)
+        if ((queue eq null) || queue.isEmpty) null
+        else if (queues1.compareAndSet(i, queue, queue.tail)) {
+          _size.decrementAndGet()
+          queue.head.asInstanceOf[AnyRef]
+        } else
+          poll1() // CAS failed, try again
+      }
+
+      @tailrec def poll2(): AnyRef = {
+        val queue = queues2.get(id)
+        if ((queue eq null) || queue.isEmpty) null
+        else if (queues2.replace(id, queue, queue.tail)) {
+          _size.decrementAndGet()
+          queue.head.asInstanceOf[AnyRef]
+        } else
+          poll2() // CAS failed, try again
+      }
+
+      if (id < FixedQueues) poll1() else poll2()
+    }
+
+    def remove(id: Long): Unit = {
+      (if (id < FixedQueues) queues1.getAndSet(id.toInt, null)
+      else queues2.remove(id)) match {
+        case null  ⇒
+        case queue ⇒ _size.addAndGet(-queue.size)
+      }
+    }
+
+  }
+}
+
+/**
+ * INTERNAL API
+ */
+private[akka] class PartitionHub[T](partitioner: T ⇒ Int, startAfterNbrOfStreams: Int, bufferSize: Int)
+  extends GraphStageWithMaterializedValue[SinkShape[T], Source[T, NotUsed]] {
+  import PartitionHub.FixedQueues
+
+  val in: Inlet[T] = Inlet("PartitionHub.in")
+  override val shape: SinkShape[T] = SinkShape(in)
+
+  private sealed trait HubEvent
+
+  private object RegistrationPending extends HubEvent
+  private final case class UnRegister(id: Long) extends HubEvent
+  private final case class NeedWakeup(consumer: Consumer) extends HubEvent
+
+  private final case class Consumer(id: Long, callback: AsyncCallback[ConsumerEvent])
+
+  private object Completed
+
+  private sealed trait HubState
+  private case class Open(callbackFuture: Future[AsyncCallback[HubEvent]], registrations: List[Consumer]) extends HubState
+  private case class Closed(failure: Option[Throwable]) extends HubState
+
+  private class PartitionSinkLogic(_shape: Shape)
+    extends GraphStageLogic(_shape) with InHandler {
+
+    private val callbackPromise: Promise[AsyncCallback[HubEvent]] = Promise()
+    private val noRegistrationsState = Open(callbackPromise.future, Nil)
+    val state = new AtomicReference[HubState](noRegistrationsState)
+    private var initialized = false
+
+    private val queue = new PartitionHub.PartitionQueue
+    private var pending = Vector.empty[T]
+    private var consumers: Vector[Consumer] = Vector.empty // FIXME perf
+    private val needWakeup: LongMap[Consumer] = LongMap.empty
+
+    override def preStart(): Unit = {
+      setKeepGoing(true)
+      callbackPromise.success(getAsyncCallback[HubEvent](onEvent))
+      if (startAfterNbrOfStreams == 0)
+        pull(in)
+    }
+
+    override def onPush(): Unit = {
+      publish(grab(in))
+      if (!isFull) pull(in)
+    }
+
+    private def isFull: Boolean = {
+      (queue.size + pending.size) >= bufferSize
+    }
+
+    private def publish(elem: T): Unit = {
+      if (!initialized || consumers.isEmpty) {
+        // will be published when first consumers are registered
+        pending :+= elem
+      } else {
+        val p = partitioner(elem)
+        val id = consumers(p % consumers.size).id
+        queue.offer(id, elem)
+        wakeup(id)
+      }
+    }
+
+    private def wakeup(id: Long): Unit = {
+      needWakeup.get(id) match {
+        case None ⇒
+        case Some(consumer) ⇒
+          needWakeup -= id
+          consumer.callback.invoke(Wakeup)
+      }
+    }
+
+    override def onUpstreamFinish(): Unit = {
+      if (consumers.isEmpty)
+        completeStage()
+      else {
+        consumers.foreach(c ⇒ complete(c.id))
+      }
+    }
+
+    private def complete(id: Long): Unit = {
+      queue.offer(id, Completed)
+      wakeup(id)
+    }
+
+    private def tryPull(): Unit = {
+      if (initialized && !isClosed(in) && !hasBeenPulled(in) && !isFull)
+        pull(in)
+    }
+
+    private def onEvent(ev: HubEvent): Unit = {
+      ev match {
+        case RegistrationPending ⇒
+          state.getAndSet(noRegistrationsState).asInstanceOf[Open].registrations foreach { consumer ⇒
+            consumers :+= consumer
+            consumers = consumers.sortBy(_.id)
+            queue.init(consumer.id)
+            if (consumers.size >= startAfterNbrOfStreams) {
+              initialized = true
+            }
+
+            consumer.callback.invoke(Initialize)
+
+            if (initialized && pending.nonEmpty) {
+              pending.foreach(publish)
+              pending = Vector.empty[T]
+            }
+
+            tryPull()
+          }
+
+        case UnRegister(id) ⇒
+          consumers = consumers.filterNot(_.id == id)
+          queue.remove(id)
+          // FIXME completed?
+          if (consumers.isEmpty) {
+            if (isClosed(in)) completeStage()
+          } else
+            tryPull()
+
+        case NeedWakeup(consumer) ⇒
+          // Also check if the consumer is now unblocked since we published an element since it went asleep.
+          if (queue.nonEmpty(consumer.id))
+            consumer.callback.invoke(Wakeup)
+          else {
+            needWakeup.update(consumer.id, consumer)
+            tryPull()
+          }
+      }
+    }
+
+    override def onUpstreamFailure(ex: Throwable): Unit = {
+      val failMessage = HubCompleted(Some(ex))
+
+      // Notify pending consumers and set tombstone
+      state.getAndSet(Closed(Some(ex))).asInstanceOf[Open].registrations foreach { consumer ⇒
+        consumer.callback.invoke(failMessage)
+      }
+
+      // Notify registered consumers
+      consumers.foreach { consumer ⇒
+        consumer.callback.invoke(failMessage)
+      }
+      failStage(ex)
+    }
+
+    override def postStop(): Unit = {
+      // Notify pending consumers and set tombstone
+
+      @tailrec def tryClose(): Unit = state.get() match {
+        case Closed(_) ⇒ // Already closed, ignore
+        case open: Open ⇒
+          if (state.compareAndSet(open, Closed(None))) {
+            val completedMessage = HubCompleted(None)
+            open.registrations foreach { consumer ⇒
+              consumer.callback.invoke(completedMessage)
+            }
+          } else tryClose()
+      }
+
+      tryClose()
+    }
+
+    // Consumer API
+    def poll(id: Long): AnyRef = {
+      // should it pull via async callback when half full?
+      queue.poll(id)
+    }
+
+    setHandler(in, this)
+  }
+
+  private sealed trait ConsumerEvent
+  private object Wakeup extends ConsumerEvent
+  private final case class HubCompleted(failure: Option[Throwable]) extends ConsumerEvent
+  private case object Initialize extends ConsumerEvent
+
+  override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, Source[T, NotUsed]) = {
+    val idCounter = new AtomicLong
+
+    val logic = new PartitionSinkLogic(shape)
+
+    val source = new GraphStage[SourceShape[T]] {
+      val out: Outlet[T] = Outlet("PartitionHub.out")
+      override val shape: SourceShape[T] = SourceShape(out)
+
+      override def createLogic(inheritedAttributes: Attributes): GraphStageLogic = new GraphStageLogic(shape) with OutHandler {
+        private val id = idCounter.getAndIncrement()
+        private var hubCallback: AsyncCallback[HubEvent] = _
+        private val callback = getAsyncCallback(onCommand)
+        private val consumer = Consumer(id, callback)
+
+        override def preStart(): Unit = {
+          val onHubReady: Try[AsyncCallback[HubEvent]] ⇒ Unit = {
+            case Success(callback) ⇒
+              hubCallback = callback
+              callback.invoke(RegistrationPending)
+              if (isAvailable(out)) onPull()
+            case Failure(ex) ⇒
+              failStage(ex)
+          }
+
+          @tailrec def register(): Unit = {
+            logic.state.get() match {
+              case Closed(Some(ex)) ⇒ failStage(ex)
+              case Closed(None)     ⇒ completeStage()
+              case previousState @ Open(callbackFuture, registrations) ⇒
+                val newRegistrations = consumer :: registrations
+                if (logic.state.compareAndSet(previousState, Open(callbackFuture, newRegistrations))) {
+                  callbackFuture.onComplete(getAsyncCallback(onHubReady).invoke)(materializer.executionContext)
+                } else register()
+            }
+          }
+
+          /*
+           * Note that there is a potential race here. First we add ourselves to the pending registrations, then
+           * we send RegistrationPending. However, another downstream might have triggered our registration by its
+           * own RegistrationPending message, since we are in the list already.
+           * This means we might receive an onCommand(Initialize) *before* onHubReady fires so it is important
+           * to only serve elements after both offsetInitialized = true and hubCallback is not null. FIXME
+           */
+          register()
+
+        }
+
+        override def onPull(): Unit = {
+          if (hubCallback ne null) {
+            val elem = logic.poll(id)
+
+            elem match {
+              case null ⇒
+                hubCallback.invoke(NeedWakeup(consumer))
+              case Completed ⇒
+                completeStage()
+              case _ ⇒
+                push(out, elem.asInstanceOf[T])
+            }
+          }
+        }
+
+        override def postStop(): Unit = {
+          if (hubCallback ne null)
+            hubCallback.invoke(UnRegister(id))
+        }
+
+        private def onCommand(cmd: ConsumerEvent): Unit = cmd match {
+          case HubCompleted(Some(ex)) ⇒ failStage(ex)
+          case HubCompleted(None)     ⇒ completeStage()
+          case Wakeup ⇒
+            if (isAvailable(out)) onPull()
+          case Initialize ⇒
             if (isAvailable(out) && (hubCallback ne null)) onPull()
         }
 

@@ -759,6 +759,9 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
               .run()(materializer)
           }(collection.breakOut)
 
+        // FIXME the AeronSource is "started" in the first run and it might be possible that first messages are delivered
+        // before lane2 is started and thereby messages could be lost
+
         import system.dispatcher
         val completed = Future.sequence(completedValues).map(_ ⇒ Done)
 
