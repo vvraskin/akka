@@ -91,26 +91,29 @@ class PartitionHubBenchmark {
     }
   }
 
-  //  @Benchmark
-  //  @OperationsPerInvocation(OperationsPerInvocation)
-  //  def broadcastFilter(): Unit = {
-  //    // FIXME this can be removed, just for baseline comparison
-  //    val N = OperationsPerInvocation
-  //    val latch = new CountDownLatch(NumberOfStreams)
-  //
-  //    val source = testSource
-  //      .runWith(BroadcastHub.sink[java.lang.Integer](bufferSize = BufferSize))(materializer)
-  //
-  //    for (n <- 0 until NumberOfStreams)
-  //      source
-  //        .filter(_.intValue % NumberOfStreams == n)
-  //        .runWith(new LatchSink(N / NumberOfStreams, latch))(materializer)
-  //
-  //    if (!latch.await(30, TimeUnit.SECONDS)) {
-  //      dumpMaterializer()
-  //      throw new RuntimeException("Latch didn't complete in time")
-  //    }
-  //  }
+  @Benchmark
+  @OperationsPerInvocation(OperationsPerInvocation)
+  def broadcastFilter(): Unit = {
+    // FIXME this can be removed, just for baseline comparison
+    val N = OperationsPerInvocation
+    val latch = new CountDownLatch(NumberOfStreams)
+
+    val (firstElem, source) = Source.maybe[java.lang.Integer].concat(testSource)
+      .toMat(BroadcastHub.sink[java.lang.Integer](bufferSize = BufferSize))(Keep.both).run()(materializer)
+
+    for (n <- 0 until NumberOfStreams)
+      source
+        .filter(_.intValue % NumberOfStreams == n)
+        .runWith(new LatchSink(N / NumberOfStreams - 1000, latch))(materializer)
+
+    //    Thread.sleep(100)
+    firstElem.success(Some(0))
+
+    if (!latch.await(30, TimeUnit.SECONDS)) {
+      dumpMaterializer()
+      throw new RuntimeException("Latch didn't complete in time")
+    }
+  }
 
   private def dumpMaterializer(): Unit = {
     materializer match {
