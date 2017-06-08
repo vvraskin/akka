@@ -23,6 +23,7 @@ import akka.stream.impl.PhasedFusingActorMaterializer
 import akka.testkit.TestProbe
 import akka.stream.impl.StreamSupervisor
 import akka.stream.scaladsl.PartitionHub
+import akka.remote.artery.FixedSizePartitionHub
 
 object PartitionHubBenchmark {
   final val OperationsPerInvocation = 100000
@@ -81,6 +82,29 @@ class PartitionHubBenchmark {
         _.intValue % NumberOfStreams,
         startAfterNbrOfStreams = NumberOfStreams, bufferSize = BufferSize
       ))(materializer)
+
+    for (_ <- 0 until NumberOfStreams)
+      source.runWith(new LatchSink(N / NumberOfStreams, latch))(materializer)
+
+    if (!latch.await(30, TimeUnit.SECONDS)) {
+      dumpMaterializer()
+      throw new RuntimeException("Latch didn't complete in time")
+    }
+  }
+
+  @Benchmark
+  @OperationsPerInvocation(OperationsPerInvocation)
+  def arteryLanes(): Unit = {
+    val N = OperationsPerInvocation
+    val latch = new CountDownLatch(NumberOfStreams)
+
+    val source = testSource
+      .runWith(
+        Sink.fromGraph(new FixedSizePartitionHub(
+          _.intValue % NumberOfStreams,
+          lanes = NumberOfStreams, bufferSize = BufferSize
+        ))
+      )(materializer)
 
     for (_ <- 0 until NumberOfStreams)
       source.runWith(new LatchSink(N / NumberOfStreams, latch))(materializer)
