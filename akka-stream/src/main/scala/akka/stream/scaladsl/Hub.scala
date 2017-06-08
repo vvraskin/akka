@@ -18,6 +18,8 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReferenceArray
 import scala.collection.mutable.LongMap
+import scala.collection.immutable.Queue
+import akka.annotation.InternalApi
 
 /**
  * A MergeHub is a special streaming hub that is able to collect streamed elements from a dynamic set of
@@ -733,86 +735,120 @@ object PartitionHub {
   def sink[T](partitioner: T ⇒ Int, startAfterNbrOfStreams: Int, bufferSize: Int = 256): Sink[T, Source[T, NotUsed]] =
     Sink.fromGraph(new PartitionHub[T](partitioner, startAfterNbrOfStreams, bufferSize))
 
-  private val FixedQueues = 128
+  /**
+   * INTERNAL API
+   */
+  @InternalApi private[akka] object Internal {
+    sealed trait ConsumerEvent
+    case object Wakeup extends ConsumerEvent
+    final case class HubCompleted(failure: Option[Throwable]) extends ConsumerEvent
+    case object Initialize extends ConsumerEvent
 
-  private class PartitionQueue {
-    // FIXME evaluate if immutable.Queue (or something else?) is better than Vector
-    private val queues1 = new AtomicReferenceArray[Vector[Any]](FixedQueues)
-    private val queues2 = new ConcurrentHashMap[Long, Vector[Any]]
-    private val _size = new AtomicInteger
+    sealed trait HubEvent
+    case object RegistrationPending extends HubEvent
+    final case class UnRegister(id: Long) extends HubEvent
+    final case class NeedWakeup(consumer: Consumer) extends HubEvent
+    final case class Consumer(id: Long, callback: AsyncCallback[ConsumerEvent])
+    case object TryPull extends HubEvent
 
-    def init(id: Long): Unit = {
-      if (id < FixedQueues)
-        queues1.set(id.toInt, Vector.empty)
-      else
-        queues2.put(id, Vector.empty)
+    case object Completed
+
+    sealed trait HubState
+    final case class Open(callbackFuture: Future[AsyncCallback[HubEvent]], registrations: List[Consumer]) extends HubState
+    final case class Closed(failure: Option[Throwable]) extends HubState
+
+    private val FixedQueues = 128
+
+    // Need the queue to be pluggable to be able to use a more performant (less general)
+    // queue in Artery
+    trait PartitionQueue {
+      def init(id: Long): Unit
+      def size: Int
+      def isEmpty(id: Long): Boolean
+      def nonEmpty(id: Long): Boolean
+      def offer(id: Long, elem: Any): Unit
+      def poll(id: Long): AnyRef
+      def remove(id: Long): Unit
     }
 
-    def size: Int = _size.get
+    class PartitionQueueImpl extends PartitionQueue {
+      private val queues1 = new AtomicReferenceArray[Queue[Any]](FixedQueues)
+      private val queues2 = new ConcurrentHashMap[Long, Queue[Any]]
+      private val _size = new AtomicInteger
 
-    def isEmpty(id: Long): Boolean = {
-      val queue =
-        if (id < FixedQueues) queues1.get(id.toInt)
-        else queues2.get(id)
-      queue.isEmpty
-    }
-
-    def nonEmpty(id: Long): Boolean = !isEmpty(id)
-
-    def offer(id: Long, elem: Any): Unit = {
-      @tailrec def offer1(): Unit = {
-        val i = id.toInt
-        val queue = queues1.get(i)
-        if (queues1.compareAndSet(i, queue, queue :+ elem))
-          _size.incrementAndGet()
+      def init(id: Long): Unit = {
+        if (id < FixedQueues)
+          queues1.set(id.toInt, Queue.empty)
         else
-          offer1() // CAS failed, retry
+          queues2.put(id, Queue.empty)
       }
 
-      @tailrec def offer2(): Unit = {
-        val queue = queues2.get(id)
-        if (queues2.replace(id, queue, queue :+ elem)) {
-          _size.incrementAndGet()
-        } else
-          offer2() // CAS failed, retry
+      def size: Int = _size.get
+
+      def isEmpty(id: Long): Boolean = {
+        val queue =
+          if (id < FixedQueues) queues1.get(id.toInt)
+          else queues2.get(id)
+        queue.isEmpty
       }
 
-      if (id < FixedQueues) offer1() else offer2()
+      def nonEmpty(id: Long): Boolean = !isEmpty(id)
+
+      def offer(id: Long, elem: Any): Unit = {
+        @tailrec def offer1(): Unit = {
+          val i = id.toInt
+          val queue = queues1.get(i)
+          if (queues1.compareAndSet(i, queue, queue.enqueue(elem)))
+            _size.incrementAndGet()
+          else
+            offer1() // CAS failed, retry
+        }
+
+        @tailrec def offer2(): Unit = {
+          val queue = queues2.get(id)
+          if (queues2.replace(id, queue, queue.enqueue(elem))) {
+            _size.incrementAndGet()
+          } else
+            offer2() // CAS failed, retry
+        }
+
+        if (id < FixedQueues) offer1() else offer2()
+      }
+
+      def poll(id: Long): AnyRef = {
+        @tailrec def poll1(): AnyRef = {
+          val i = id.toInt
+          val queue = queues1.get(i)
+          if ((queue eq null) || queue.isEmpty) null
+          else if (queues1.compareAndSet(i, queue, queue.tail)) {
+            _size.decrementAndGet()
+            queue.head.asInstanceOf[AnyRef]
+          } else
+            poll1() // CAS failed, try again
+        }
+
+        @tailrec def poll2(): AnyRef = {
+          val queue = queues2.get(id)
+          if ((queue eq null) || queue.isEmpty) null
+          else if (queues2.replace(id, queue, queue.tail)) {
+            _size.decrementAndGet()
+            queue.head.asInstanceOf[AnyRef]
+          } else
+            poll2() // CAS failed, try again
+        }
+
+        if (id < FixedQueues) poll1() else poll2()
+      }
+
+      def remove(id: Long): Unit = {
+        (if (id < FixedQueues) queues1.getAndSet(id.toInt, null)
+        else queues2.remove(id)) match {
+          case null  ⇒
+          case queue ⇒ _size.addAndGet(-queue.size)
+        }
+      }
+
     }
-
-    def poll(id: Long): AnyRef = {
-      @tailrec def poll1(): AnyRef = {
-        val i = id.toInt
-        val queue = queues1.get(i)
-        if ((queue eq null) || queue.isEmpty) null
-        else if (queues1.compareAndSet(i, queue, queue.tail)) {
-          _size.decrementAndGet()
-          queue.head.asInstanceOf[AnyRef]
-        } else
-          poll1() // CAS failed, try again
-      }
-
-      @tailrec def poll2(): AnyRef = {
-        val queue = queues2.get(id)
-        if ((queue eq null) || queue.isEmpty) null
-        else if (queues2.replace(id, queue, queue.tail)) {
-          _size.decrementAndGet()
-          queue.head.asInstanceOf[AnyRef]
-        } else
-          poll2() // CAS failed, try again
-      }
-
-      if (id < FixedQueues) poll1() else poll2()
-    }
-
-    def remove(id: Long): Unit = {
-      (if (id < FixedQueues) queues1.getAndSet(id.toInt, null)
-      else queues2.remove(id)) match {
-        case null  ⇒
-        case queue ⇒ _size.addAndGet(-queue.size)
-      }
-    }
-
   }
 }
 
@@ -821,37 +857,30 @@ object PartitionHub {
  */
 private[akka] class PartitionHub[T](partitioner: T ⇒ Int, startAfterNbrOfStreams: Int, bufferSize: Int)
   extends GraphStageWithMaterializedValue[SinkShape[T], Source[T, NotUsed]] {
-  import PartitionHub.FixedQueues
+  import PartitionHub.Internal._
 
   val in: Inlet[T] = Inlet("PartitionHub.in")
   override val shape: SinkShape[T] = SinkShape(in)
 
-  private sealed trait HubEvent
-
-  private object RegistrationPending extends HubEvent
-  private final case class UnRegister(id: Long) extends HubEvent
-  private final case class NeedWakeup(consumer: Consumer) extends HubEvent
-
-  private final case class Consumer(id: Long, callback: AsyncCallback[ConsumerEvent])
-
-  private object Completed
-
-  private sealed trait HubState
-  private case class Open(callbackFuture: Future[AsyncCallback[HubEvent]], registrations: List[Consumer]) extends HubState
-  private case class Closed(failure: Option[Throwable]) extends HubState
+  def createQueue(): PartitionQueue = new PartitionQueueImpl
 
   private class PartitionSinkLogic(_shape: Shape)
     extends GraphStageLogic(_shape) with InHandler {
+
+    // Half of buffer size, rounded up
+    private val DemandThreshold = (bufferSize / 2) + (bufferSize % 2)
 
     private val callbackPromise: Promise[AsyncCallback[HubEvent]] = Promise()
     private val noRegistrationsState = Open(callbackPromise.future, Nil)
     val state = new AtomicReference[HubState](noRegistrationsState)
     private var initialized = false
 
-    private val queue = new PartitionHub.PartitionQueue
+    private val queue = createQueue()
     private var pending = Vector.empty[T]
     private var consumers: Vector[Consumer] = Vector.empty // FIXME perf
     private val needWakeup: LongMap[Consumer] = LongMap.empty
+
+    private var callbackCount = 0L
 
     override def preStart(): Unit = {
       setKeepGoing(true)
@@ -909,7 +938,20 @@ private[akka] class PartitionHub[T](partitioner: T ⇒ Int, startAfterNbrOfStrea
     }
 
     private def onEvent(ev: HubEvent): Unit = {
+      callbackCount += 1
       ev match {
+        case NeedWakeup(consumer) ⇒
+          // Also check if the consumer is now unblocked since we published an element since it went asleep.
+          if (queue.nonEmpty(consumer.id))
+            consumer.callback.invoke(Wakeup)
+          else {
+            needWakeup.update(consumer.id, consumer)
+            tryPull()
+          }
+
+        case TryPull ⇒
+          tryPull()
+
         case RegistrationPending ⇒
           state.getAndSet(noRegistrationsState).asInstanceOf[Open].registrations foreach { consumer ⇒
             consumers :+= consumer
@@ -937,15 +979,6 @@ private[akka] class PartitionHub[T](partitioner: T ⇒ Int, startAfterNbrOfStrea
             if (isClosed(in)) completeStage()
           } else
             tryPull()
-
-        case NeedWakeup(consumer) ⇒
-          // Also check if the consumer is now unblocked since we published an element since it went asleep.
-          if (queue.nonEmpty(consumer.id))
-            consumer.callback.invoke(Wakeup)
-          else {
-            needWakeup.update(consumer.id, consumer)
-            tryPull()
-          }
       }
     }
 
@@ -978,22 +1011,23 @@ private[akka] class PartitionHub[T](partitioner: T ⇒ Int, startAfterNbrOfStrea
           } else tryClose()
       }
 
+      //println(s"# hub callback count $callbackCount") // FIXME
+
       tryClose()
     }
 
     // Consumer API
-    def poll(id: Long): AnyRef = {
-      // should it pull via async callback when half full?
+    def poll(id: Long, hubCallback: AsyncCallback[HubEvent]): AnyRef = {
+      // try pull via async callback when half full
+      // this is racy with other threads doing poll but doesn't matter
+      if (queue.size == DemandThreshold)
+        hubCallback.invoke(TryPull)
+
       queue.poll(id)
     }
 
     setHandler(in, this)
   }
-
-  private sealed trait ConsumerEvent
-  private object Wakeup extends ConsumerEvent
-  private final case class HubCompleted(failure: Option[Throwable]) extends ConsumerEvent
-  private case object Initialize extends ConsumerEvent
 
   override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, Source[T, NotUsed]) = {
     val idCounter = new AtomicLong
@@ -1009,6 +1043,8 @@ private[akka] class PartitionHub[T](partitioner: T ⇒ Int, startAfterNbrOfStrea
         private var hubCallback: AsyncCallback[HubEvent] = _
         private val callback = getAsyncCallback(onCommand)
         private val consumer = Consumer(id, callback)
+
+        private var callbackCount = 0L
 
         override def preStart(): Unit = {
           val onHubReady: Try[AsyncCallback[HubEvent]] ⇒ Unit = {
@@ -1045,7 +1081,7 @@ private[akka] class PartitionHub[T](partitioner: T ⇒ Int, startAfterNbrOfStrea
 
         override def onPull(): Unit = {
           if (hubCallback ne null) {
-            val elem = logic.poll(id)
+            val elem = logic.poll(id, hubCallback)
 
             elem match {
               case null ⇒
@@ -1061,15 +1097,19 @@ private[akka] class PartitionHub[T](partitioner: T ⇒ Int, startAfterNbrOfStrea
         override def postStop(): Unit = {
           if (hubCallback ne null)
             hubCallback.invoke(UnRegister(id))
+          //println(s"# consumer $id callbackCount $callbackCount") // FIXME
         }
 
-        private def onCommand(cmd: ConsumerEvent): Unit = cmd match {
-          case HubCompleted(Some(ex)) ⇒ failStage(ex)
-          case HubCompleted(None)     ⇒ completeStage()
-          case Wakeup ⇒
-            if (isAvailable(out)) onPull()
-          case Initialize ⇒
-            if (isAvailable(out) && (hubCallback ne null)) onPull()
+        private def onCommand(cmd: ConsumerEvent): Unit = {
+          callbackCount += 1
+          cmd match {
+            case HubCompleted(Some(ex)) ⇒ failStage(ex)
+            case HubCompleted(None)     ⇒ completeStage()
+            case Wakeup ⇒
+              if (isAvailable(out)) onPull()
+            case Initialize ⇒
+              if (isAvailable(out) && (hubCallback ne null)) onPull()
+          }
         }
 
         setHandler(out, this)
