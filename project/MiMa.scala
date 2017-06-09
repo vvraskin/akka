@@ -1217,7 +1217,13 @@ object MiMa extends AutoPlugin {
         ProblemFilters.exclude[DirectMissingMethodProblem]("akka.pattern.BackoffOnRestartSupervisor.this"),
         ProblemFilters.exclude[ReversedMissingMethodProblem]("akka.pattern.HandleBackoff.replyWhileStopped"),
         ProblemFilters.exclude[ReversedMissingMethodProblem]("akka.pattern.BackoffOptions.withReplyWhileStopped")
+      ),
+      "2.5.1" -> Seq(
+
+        // #21880 PartitionHub in Artery
+        ProblemFilters.exclude[DirectMissingMethodProblem]("akka.remote.artery.ArterySettings#Advanced.InboundBroadcastHubBufferSize")
       )
+      // make sure that this list ends with the latest released version number
     )
 
     val Latest24Filters = Release24Filters.last
