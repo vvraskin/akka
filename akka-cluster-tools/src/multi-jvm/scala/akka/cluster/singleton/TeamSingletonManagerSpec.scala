@@ -106,5 +106,19 @@ abstract class TeamSingletonManagerSpec extends MultiNodeSpec(TeamSingletonManag
       enterBarrier("after-1")
     }
 
+    "be able to use proxy across different team" in {
+      runOn(third) {
+        val proxy = system.actorOf(ClusterSingletonProxy.props(
+          "/user/singletonManager",
+          ClusterSingletonProxySettings(system).withRole(worker).withTeam("one")))
+        proxy ! TeamSingleton.Ping
+        val pong = expectMsgType[TeamSingleton.Pong](10.seconds)
+        pong.fromTeam should ===("one")
+        pong.roles should contain(worker)
+        pong.roles should contain("team-one")
+      }
+      enterBarrier("after-1")
+    }
+
   }
 }
