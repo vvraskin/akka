@@ -15,7 +15,7 @@ import org.agrona.concurrent.ManyToManyConcurrentArrayQueue
 @InternalApi private[akka] class FixedSizePartitionHub[T](
   partitioner: T ⇒ Int,
   lanes:       Int,
-  bufferSize:  Int) extends PartitionHub[T](partitioner, lanes, bufferSize - 1) {
+  bufferSize:  Int) extends PartitionHub[T](() ⇒ (ids, elem) ⇒ ids(partitioner(elem)), lanes, bufferSize - 1) {
   // -1 because of the Completed token
 
   override def createQueue(): PartitionHub.Internal.PartitionQueue =

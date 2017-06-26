@@ -732,7 +732,7 @@ object PartitionHub {
    *                   concurrent consumers can be in terms of element. If this buffer is full, the producer
    *                   is backpressured. Must be a power of two and less than 4096.
    */
-  def sink[T](partitioner: T ⇒ Int, startAfterNbrOfStreams: Int, bufferSize: Int = 256): Sink[T, Source[T, NotUsed]] =
+  def sink[T](partitioner: () ⇒ (Array[Long], T) ⇒ Long, startAfterNbrOfStreams: Int, bufferSize: Int = 256): Sink[T, Source[T, NotUsed]] =
     Sink.fromGraph(new PartitionHub[T](partitioner, startAfterNbrOfStreams, bufferSize))
 
   /**
@@ -798,6 +798,8 @@ object PartitionHub {
         @tailrec def offer1(): Unit = {
           val i = id.toInt
           val queue = queues1.get(i)
+          if (queue eq null)
+            throw new IllegalArgumentException(s"Invalid stream identifier: $id")
           if (queues1.compareAndSet(i, queue, queue.enqueue(elem)))
             _size.incrementAndGet()
           else
@@ -806,6 +808,8 @@ object PartitionHub {
 
         @tailrec def offer2(): Unit = {
           val queue = queues2.get(id)
+          if (queue eq null)
+            throw new IllegalArgumentException(s"Invalid stream identifier: $id")
           if (queues2.replace(id, queue, queue.enqueue(elem))) {
             _size.incrementAndGet()
           } else
@@ -855,7 +859,7 @@ object PartitionHub {
 /**
  * INTERNAL API
  */
-private[akka] class PartitionHub[T](partitioner: T ⇒ Int, startAfterNbrOfStreams: Int, bufferSize: Int)
+private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Long, startAfterNbrOfStreams: Int, bufferSize: Int)
   extends GraphStageWithMaterializedValue[SinkShape[T], Source[T, NotUsed]] {
   import PartitionHub.Internal._
 
@@ -870,6 +874,8 @@ private[akka] class PartitionHub[T](partitioner: T ⇒ Int, startAfterNbrOfStrea
     // Half of buffer size, rounded up
     private val DemandThreshold = (bufferSize / 2) + (bufferSize % 2)
 
+    private val materializedPartitioner = partitioner()
+
     private val callbackPromise: Promise[AsyncCallback[HubEvent]] = Promise()
     private val noRegistrationsState = Open(callbackPromise.future, Nil)
     val state = new AtomicReference[HubState](noRegistrationsState)
@@ -879,6 +885,7 @@ private[akka] class PartitionHub[T](partitioner: T ⇒ Int, startAfterNbrOfStrea
     private var pending = Vector.empty[T]
     private var consumers: Vector[Consumer] = Vector.empty // FIXME perf
     private val needWakeup: LongMap[Consumer] = LongMap.empty
+    private var consumerIds: Array[Long] = Array.emptyLongArray
 
     private var callbackCount = 0L
 
@@ -903,8 +910,7 @@ private[akka] class PartitionHub[T](partitioner: T ⇒ Int, startAfterNbrOfStrea
         // will be published when first consumers are registered
         pending :+= elem
       } else {
-        val p = partitioner(elem)
-        val id = consumers(p % consumers.size).id
+        val id = materializedPartitioner(consumerIds, elem)
         queue.offer(id, elem)
         wakeup(id)
       }
@@ -956,6 +962,8 @@ private[akka] class PartitionHub[T](partitioner: T ⇒ Int, startAfterNbrOfStrea
           state.getAndSet(noRegistrationsState).asInstanceOf[Open].registrations foreach { consumer ⇒
             consumers :+= consumer
             consumers = consumers.sortBy(_.id)
+            consumerIds :+= consumer.id
+            consumerIds.sorted
             queue.init(consumer.id)
             if (consumers.size >= startAfterNbrOfStreams) {
               initialized = true
@@ -973,6 +981,7 @@ private[akka] class PartitionHub[T](partitioner: T ⇒ Int, startAfterNbrOfStrea
 
         case UnRegister(id) ⇒
           consumers = consumers.filterNot(_.id == id)
+          consumerIds = consumerIds.filterNot(_ == id)
           queue.remove(id)
           // FIXME completed?
           if (consumers.isEmpty) {
