@@ -115,7 +115,8 @@ class HubsDocSpec extends AkkaSpec with CompileOnlySpec {
       // (We need to use toMat and Keep.right since by default the materialized
       // value to the left is used)
       val runnableGraph: RunnableGraph[Source[String, NotUsed]] =
-        producer.toMat(PartitionHub.sink((size, elem) => math.abs(elem.hashCode) % size,
+        producer.toMat(PartitionHub.sink(
+          (size, elem) => math.abs(elem.hashCode) % size,
           startAfterNbrOfConsumers = 2, bufferSize = 256))(Keep.right)
 
       // By running/materializing the producer, we get back a Source, which
@@ -150,7 +151,8 @@ class HubsDocSpec extends AkkaSpec with CompileOnlySpec {
       // (We need to use toMat and Keep.right since by default the materialized
       // value to the left is used)
       val runnableGraph: RunnableGraph[Source[String, NotUsed]] =
-        producer.toMat(PartitionHub.statefulSink(() => roundRobin(),
+        producer.toMat(PartitionHub.statefulSink(
+          () => roundRobin(),
           startAfterNbrOfConsumers = 2, bufferSize = 256))(Keep.right)
 
       // By running/materializing the producer, we get back a Source, which
