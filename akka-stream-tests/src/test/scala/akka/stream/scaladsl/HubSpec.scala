@@ -12,6 +12,7 @@ import akka.testkit.EventFilter
 import scala.collection.immutable
 import scala.concurrent.Await
 import scala.concurrent.duration._
+import akka.testkit.TestLatch
 
 class HubSpec extends StreamSpec {
 
@@ -370,14 +371,17 @@ class HubSpec extends StreamSpec {
   "PartitionHub" must {
 
     "work in the happy case with one stream" in assertAllStagesStopped {
-      val source = Source(1 to 10).runWith(PartitionHub.sink(() ⇒ (ids, elem) ⇒ ids(0), startAfterNbrOfStreams = 0, bufferSize = 8))
+      val source = Source(1 to 10).runWith(PartitionHub.sink((size, elem) ⇒ 0, startAfterNbrOfConsumers = 0, bufferSize = 8))
       source.runWith(Sink.seq).futureValue should ===(1 to 10)
     }
 
     "work in the happy case with two streams" in assertAllStagesStopped {
-      val source = Source(0 until 10).runWith(PartitionHub.sink(() ⇒ (ids, elem) ⇒ ids(elem % ids.length), startAfterNbrOfStreams = 2, bufferSize = 8))
-      val result1 = source.runWith(Sink.seq)
-      // it should not start publishing until startAfterNbrOfStreams = 2
+      val source = Source(0 until 10).runWith(PartitionHub.sink((size, elem) ⇒ elem % size, startAfterNbrOfConsumers = 2, bufferSize = 8))
+      // latch to make materialization order deterministic
+      val latch = TestLatch(1)
+      val result1 = source.toMat(Sink.seq)(Keep.right).mapMaterializedValue(m ⇒ { latch.countDown(); m }).run()
+      Await.ready(latch, remainingOrDefault)
+      // it should not start publishing until startAfterNbrOfConsumers = 2
       Thread.sleep(20)
       val result2 = source.runWith(Sink.seq)
       result1.futureValue should ===(0 to 8 by 2)
@@ -385,22 +389,25 @@ class HubSpec extends StreamSpec {
     }
 
     "be able to use as round-robin router" in assertAllStagesStopped {
-      val source = Source(0 until 10).runWith(PartitionHub.sink(() ⇒ {
+      val source = Source(0 until 10).runWith(PartitionHub.statefulSink(() ⇒ {
         var n = 0L
 
         (ids, elem) ⇒ {
           n += 1
           ids((n % ids.length).toInt)
         }
-      }, startAfterNbrOfStreams = 2, bufferSize = 8))
-      val result1 = source.runWith(Sink.seq)
+      }, startAfterNbrOfConsumers = 2, bufferSize = 8))
+      // latch to make materialization order deterministic
+      val latch = TestLatch(1)
+      val result1 = source.toMat(Sink.seq)(Keep.right).mapMaterializedValue(m ⇒ { latch.countDown(); m }).run()
+      Await.ready(latch, remainingOrDefault)
       val result2 = source.runWith(Sink.seq)
       result1.futureValue should ===(1 to 9 by 2)
       result2.futureValue should ===(0 to 8 by 2)
     }
 
     "be able to use as sticky session router" in assertAllStagesStopped {
-      val source = Source(List("usr-1", "usr-2", "usr-1", "usr-3")).runWith(PartitionHub.sink(() ⇒ {
+      val source = Source(List("usr-1", "usr-2", "usr-1", "usr-3")).runWith(PartitionHub.statefulSink(() ⇒ {
         var sessions = Map.empty[String, Long]
         var n = 0L
 
@@ -414,8 +421,11 @@ class HubSpec extends StreamSpec {
               id
           }
         }
-      }, startAfterNbrOfStreams = 2, bufferSize = 8))
-      val result1 = source.runWith(Sink.seq)
+      }, startAfterNbrOfConsumers = 2, bufferSize = 8))
+      // latch to make materialization order deterministic
+      val latch = TestLatch(1)
+      val result1 = source.toMat(Sink.seq)(Keep.right).mapMaterializedValue(m ⇒ { latch.countDown(); m }).run()
+      Await.ready(latch, remainingOrDefault)
       val result2 = source.runWith(Sink.seq)
       result1.futureValue should ===(List("usr-2"))
       result2.futureValue should ===(List("usr-1", "usr-1", "usr-3"))
@@ -423,8 +433,11 @@ class HubSpec extends StreamSpec {
 
     "route evenly" in assertAllStagesStopped {
       val (testSource, hub) = TestSource.probe[Int].toMat(
-        PartitionHub.sink(() ⇒ (ids, elem) ⇒ ids(elem % ids.length), startAfterNbrOfStreams = 2, bufferSize = 8))(Keep.both).run()
-      val probe0 = hub.runWith(TestSink.probe[Int])
+        PartitionHub.sink((size, elem) ⇒ elem % size, startAfterNbrOfConsumers = 2, bufferSize = 8))(Keep.both).run()
+      // latch to make materialization order deterministic
+      val latch = TestLatch(1)
+      val probe0 = hub.toMat(TestSink.probe[Int])(Keep.right).mapMaterializedValue(m ⇒ { latch.countDown(); m }).run()
+      Await.ready(latch, remainingOrDefault)
       val probe1 = hub.runWith(TestSink.probe[Int])
       probe0.request(3)
       probe1.request(10)
@@ -457,8 +470,11 @@ class HubSpec extends StreamSpec {
 
     "route unevenly" in assertAllStagesStopped {
       val (testSource, hub) = TestSource.probe[Int].toMat(
-        PartitionHub.sink(() ⇒ (ids, elem) ⇒ ids((elem % 3) % 2), startAfterNbrOfStreams = 2, bufferSize = 8))(Keep.both).run()
-      val probe0 = hub.runWith(TestSink.probe[Int])
+        PartitionHub.sink((size, elem) ⇒ (elem % 3) % 2, startAfterNbrOfConsumers = 2, bufferSize = 8))(Keep.both).run()
+      // latch to make materialization order deterministic
+      val latch = TestLatch(1)
+      val probe0 = hub.toMat(TestSink.probe[Int])(Keep.right).mapMaterializedValue(m ⇒ { latch.countDown(); m }).run()
+      Await.ready(latch, remainingOrDefault)
       val probe1 = hub.runWith(TestSink.probe[Int])
 
       // (_ % 3) % 2
@@ -488,8 +504,11 @@ class HubSpec extends StreamSpec {
 
     "backpressure" in assertAllStagesStopped {
       val (testSource, hub) = TestSource.probe[Int].toMat(
-        PartitionHub.sink(() ⇒ (ids, elem) ⇒ ids(0), startAfterNbrOfStreams = 2, bufferSize = 4))(Keep.both).run()
-      val probe0 = hub.runWith(TestSink.probe[Int])
+        PartitionHub.sink((size, elem) ⇒ 0, startAfterNbrOfConsumers = 2, bufferSize = 4))(Keep.both).run()
+      // latch to make materialization order deterministic
+      val latch = TestLatch(1)
+      val probe0 = hub.toMat(TestSink.probe[Int])(Keep.right).mapMaterializedValue(m ⇒ { latch.countDown(); m }).run()
+      Await.ready(latch, remainingOrDefault)
       val probe1 = hub.runWith(TestSink.probe[Int])
       probe0.request(10)
       probe1.request(10)
@@ -511,9 +530,13 @@ class HubSpec extends StreamSpec {
 
     "ensure that from two different speed consumers the slower controls the rate" in assertAllStagesStopped {
       val (firstElem, source) = Source.maybe[Int].concat(Source(1 until 20)).toMat(
-        PartitionHub.sink(() ⇒ (ids, elem) ⇒ ids(elem % ids.length), startAfterNbrOfStreams = 2, bufferSize = 1))(Keep.both).run()
+        PartitionHub.sink((size, elem) ⇒ elem % size, startAfterNbrOfConsumers = 2, bufferSize = 1))(Keep.both).run()
 
-      val f1 = source.throttle(1, 10.millis, 1, ThrottleMode.shaping).runWith(Sink.seq)
+      // latch to make materialization order deterministic
+      val latch = TestLatch(1)
+      val f1 = source.throttle(1, 10.millis, 1, ThrottleMode.shaping).toMat(Sink.seq)(Keep.right)
+        .mapMaterializedValue(m ⇒ { latch.countDown(); m }).run()
+      Await.ready(latch, remainingOrDefault)
       // Second cannot be overwhelmed since the first one throttles the overall rate, and second allows a higher rate
       val f2 = source.throttle(10, 10.millis, 8, ThrottleMode.enforcing).runWith(Sink.seq)
 
@@ -528,11 +551,14 @@ class HubSpec extends StreamSpec {
     "properly signal error to consumers" in assertAllStagesStopped {
       val upstream = TestPublisher.probe[Int]()
       val source = Source.fromPublisher(upstream).runWith(
-        PartitionHub.sink(() ⇒ (ids, elem) ⇒ ids(elem % ids.length), startAfterNbrOfStreams = 2, bufferSize = 8))
+        PartitionHub.sink((size, elem) ⇒ elem % size, startAfterNbrOfConsumers = 2, bufferSize = 8))
 
       val downstream1 = TestSubscriber.probe[Int]()
+      // latch to make materialization order deterministic
+      val latch = TestLatch(1)
+      source.to(Sink.fromSubscriber(downstream1)).mapMaterializedValue(m ⇒ { latch.countDown(); m }).run()
+      Await.ready(latch, remainingOrDefault)
       val downstream2 = TestSubscriber.probe[Int]()
-      source.runWith(Sink.fromSubscriber(downstream1))
       source.runWith(Sink.fromSubscriber(downstream2))
 
       downstream1.request(4)
@@ -553,7 +579,7 @@ class HubSpec extends StreamSpec {
     }
 
     "properly singal completion to consumers arriving after producer finished" in assertAllStagesStopped {
-      val source = Source.empty[Int].runWith(PartitionHub.sink(() ⇒ (ids, elem) ⇒ ids(elem % ids.length), startAfterNbrOfStreams = 0))
+      val source = Source.empty[Int].runWith(PartitionHub.sink((size, elem) ⇒ elem % size, startAfterNbrOfConsumers = 0))
       // Wait enough so the Hub gets the completion. This is racy, but this is fine because both
       // cases should work in the end
       Thread.sleep(10)
@@ -564,7 +590,7 @@ class HubSpec extends StreamSpec {
     "remember completion for materialisations after completion" in {
 
       val (sourceProbe, source) = TestSource.probe[Unit].toMat(
-        PartitionHub.sink(() ⇒ (ids, elem) ⇒ ids(0), startAfterNbrOfStreams = 0))(Keep.both).run()
+        PartitionHub.sink((size, elem) ⇒ 0, startAfterNbrOfConsumers = 0))(Keep.both).run()
       val sinkProbe = source.runWith(TestSink.probe[Unit])
 
       sourceProbe.sendComplete()
@@ -582,7 +608,7 @@ class HubSpec extends StreamSpec {
 
     "properly singal error to consumers arriving after producer finished" in assertAllStagesStopped {
       val source = Source.failed[Int](TE("Fail!")).runWith(
-        PartitionHub.sink(() ⇒ (ids, elem) ⇒ ids(0), startAfterNbrOfStreams = 0))
+        PartitionHub.sink((size, elem) ⇒ 0, startAfterNbrOfConsumers = 0))
       // Wait enough so the Hub gets the failure. This is racy, but this is fine because both
       // cases should work in the end
       Thread.sleep(10)

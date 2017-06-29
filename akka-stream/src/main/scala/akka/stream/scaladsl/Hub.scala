@@ -297,7 +297,7 @@ object BroadcastHub {
    * Creates a [[Sink]] that receives elements from its upstream producer and broadcasts them to a dynamic set
    * of consumers. After the [[Sink]] returned by this method is materialized, it returns a [[Source]] as materialized
    * value. This [[Source]] can be materialized an arbitrary number of times and each materialization will receive the
-   * broadcast elements form the ofiginal [[Sink]].
+   * broadcast elements from the original [[Sink]].
    *
    * Every new materialization of the [[Sink]] results in a new, independent hub, which materializes to its own
    * [[Source]] for consuming the [[Sink]] of that materialization.
@@ -701,23 +701,25 @@ private[akka] class BroadcastHub[T](bufferSize: Int) extends GraphStageWithMater
 }
 
 /**
- * FIXME write docs
- *
- * A BroadcastHub is a special streaming hub that is able to broadcast streamed elements to a dynamic set of consumers.
- * It consists of two parts, a [[Sink]] and a [[Source]]. The [[Sink]] broadcasts elements from a producer to the
- * actually live consumers it has. Once the producer has been materialized, the [[Sink]] it feeds into returns a
+ * A `PartitionHub` is a special streaming hub that is able to route streamed elements to a dynamic set of consumers.
+ * It consists of two parts, a [[Sink]] and a [[Source]]. The [[Sink]] e elements from a producer to the
+ * actually live consumers it has. The selection of consumer is done with a function. Each element can be routed to
+ * only one consumer. Once the producer has been materialized, the [[Sink]] it feeds into returns a
  * materialized value which is the corresponding [[Source]]. This [[Source]] can be materialized an arbitrary number
  * of times, where each of the new materializations will receive their elements from the original [[Sink]].
  */
 object PartitionHub {
 
   /**
-   * FIXME write docs
-   *
-   * Creates a [[Sink]] that receives elements from its upstream producer and broadcasts them to a dynamic set
+   * INTERNAL API
+   */
+  @InternalApi private[akka] val defaultBufferSize = 256
+
+  /**
+   * Creates a [[Sink]] that receives elements from its upstream producer and routes them to a dynamic set
    * of consumers. After the [[Sink]] returned by this method is materialized, it returns a [[Source]] as materialized
    * value. This [[Source]] can be materialized an arbitrary number of times and each materialization will receive the
-   * broadcast elements form the ofiginal [[Sink]].
+   * elements from the original [[Sink]].
    *
    * Every new materialization of the [[Sink]] results in a new, independent hub, which materializes to its own
    * [[Source]] for consuming the [[Sink]] of that materialization.
@@ -728,12 +730,57 @@ object PartitionHub {
    * materializations of the [[Source]] will see the same (failure or completion) state. [[Source]]s that are
    * cancelled are simply removed from the dynamic set of consumers.
    *
-   * @param bufferSize Buffer size used by the producer. Gives an upper bound on how "far" from each other two
-   *                   concurrent consumers can be in terms of element. If this buffer is full, the producer
-   *                   is backpressured. Must be a power of two and less than 4096.
+   * This `statefulSink` should be used when there is a need to keep mutable state in the partition function,
+   * e.g. for implemening round-robin or sticky session kind of routing. If state is not needed the [[#sink]] can
+   * be more convenient to use.
+   *
+   * @param partitioner Function that decides where to route an element. It is a factory of a function to
+   *   to be able to hold stateful variables that are unique for each materialization. The function
+   *   takes two parameters; the first is an array of consumer identifiers and the second is the
+   *   stream element. The function should return the selected consumer identifier for the given
+   *   element. The function will never be called when there are no active consumers, i.e. there
+   *   is always at least one element in the array of identifiers.
+   * @param startAfterNbrOfConsumers Elements are buffered until this number of consumers have been connected.
+   *   This is only used initially when the stage is starting up, i.e. it is not honored when consumers have
+   *   been removed (canceled).
+   * @param bufferSize Total number of elements that can be buffered. If this buffer is full, the producer
+   *   is backpressured.
    */
-  def sink[T](partitioner: () ⇒ (Array[Long], T) ⇒ Long, startAfterNbrOfStreams: Int, bufferSize: Int = 256): Sink[T, Source[T, NotUsed]] =
-    Sink.fromGraph(new PartitionHub[T](partitioner, startAfterNbrOfStreams, bufferSize))
+  def statefulSink[T](partitioner: () ⇒ (Array[Long], T) ⇒ Long, startAfterNbrOfConsumers: Int,
+                      bufferSize: Int = defaultBufferSize): Sink[T, Source[T, NotUsed]] =
+    Sink.fromGraph(new PartitionHub[T](partitioner, startAfterNbrOfConsumers, bufferSize))
+
+  /**
+   * Creates a [[Sink]] that receives elements from its upstream producer and routes them to a dynamic set
+   * of consumers. After the [[Sink]] returned by this method is materialized, it returns a [[Source]] as materialized
+   * value. This [[Source]] can be materialized an arbitrary number of times and each materialization will receive the
+   * elements from the original [[Sink]].
+   *
+   * Every new materialization of the [[Sink]] results in a new, independent hub, which materializes to its own
+   * [[Source]] for consuming the [[Sink]] of that materialization.
+   *
+   * If the original [[Sink]] is failed, then the failure is immediately propagated to all of its materialized
+   * [[Source]]s (possibly jumping over already buffered elements). If the original [[Sink]] is completed, then
+   * all corresponding [[Source]]s are completed. Both failure and normal completion is "remembered" and later
+   * materializations of the [[Source]] will see the same (failure or completion) state. [[Source]]s that are
+   * cancelled are simply removed from the dynamic set of consumers.
+   *
+   * This `sink` should be used when the routing function is stateless, e.g. based on a hashed value of the
+   * elements. Otherwise the [[#statefulSink]] can be used to implement more advanced routing logic.
+   *
+   * @param partitioner Function that decides where to route an element. The function takes two parameters;
+   *   the first is the number of active consumers and the second is the stream element. The function should
+   *   return the index of the selected consumer for the given element, i.e. int greater than or equal to 0
+   *   and less than number of consumers. E.g. `(size, elem) => math.abs(elem.hashCode) % size`.
+   * @param startAfterNbrOfConsumers Elements are buffered until this number of consumers have been connected.
+   *   This is only used initially when the stage is starting up, i.e. it is not honored when consumers have
+   *   been removed (canceled).
+   * @param bufferSize Total number of elements that can be buffered. If this buffer is full, the producer
+   *   is backpressured.
+   */
+  def sink[T](partitioner: (Int, T) ⇒ Int, startAfterNbrOfConsumers: Int,
+              bufferSize: Int = defaultBufferSize): Sink[T, Source[T, NotUsed]] =
+    statefulSink(() ⇒ (ids, elem) ⇒ ids(partitioner(ids.length, elem)), startAfterNbrOfConsumers, bufferSize)
 
   /**
    * INTERNAL API
@@ -859,13 +906,15 @@ object PartitionHub {
 /**
  * INTERNAL API
  */
-private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Long, startAfterNbrOfStreams: Int, bufferSize: Int)
+private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Long, startAfterNbrOfConsumers: Int, bufferSize: Int)
   extends GraphStageWithMaterializedValue[SinkShape[T], Source[T, NotUsed]] {
   import PartitionHub.Internal._
 
   val in: Inlet[T] = Inlet("PartitionHub.in")
   override val shape: SinkShape[T] = SinkShape(in)
 
+  // Need the queue to be pluggable to be able to use a more performant (less general)
+  // queue in Artery
   def createQueue(): PartitionQueue = new PartitionQueueImpl
 
   private class PartitionSinkLogic(_shape: Shape)
@@ -883,7 +932,7 @@ private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Lon
 
     private val queue = createQueue()
     private var pending = Vector.empty[T]
-    private var consumers: Vector[Consumer] = Vector.empty // FIXME perf
+    private var consumers: Vector[Consumer] = Vector.empty
     private val needWakeup: LongMap[Consumer] = LongMap.empty
     private var consumerIds: Array[Long] = Array.emptyLongArray
 
@@ -892,7 +941,7 @@ private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Lon
     override def preStart(): Unit = {
       setKeepGoing(true)
       callbackPromise.success(getAsyncCallback[HubEvent](onEvent))
-      if (startAfterNbrOfStreams == 0)
+      if (startAfterNbrOfConsumers == 0)
         pull(in)
     }
 
@@ -965,7 +1014,7 @@ private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Lon
             consumerIds :+= consumer.id
             consumerIds.sorted
             queue.init(consumer.id)
-            if (consumers.size >= startAfterNbrOfStreams) {
+            if (consumers.size >= startAfterNbrOfConsumers) {
               initialized = true
             }
 
@@ -983,7 +1032,6 @@ private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Lon
           consumers = consumers.filterNot(_.id == id)
           consumerIds = consumerIds.filterNot(_ == id)
           queue.remove(id)
-          // FIXME completed?
           if (consumers.isEmpty) {
             if (isClosed(in)) completeStage()
           } else
@@ -1019,8 +1067,6 @@ private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Lon
             }
           } else tryClose()
       }
-
-      //println(s"# hub callback count $callbackCount") // FIXME
 
       tryClose()
     }
@@ -1077,13 +1123,6 @@ private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Lon
             }
           }
 
-          /*
-           * Note that there is a potential race here. First we add ourselves to the pending registrations, then
-           * we send RegistrationPending. However, another downstream might have triggered our registration by its
-           * own RegistrationPending message, since we are in the list already.
-           * This means we might receive an onCommand(Initialize) *before* onHubReady fires so it is important
-           * to only serve elements after both offsetInitialized = true and hubCallback is not null. FIXME
-           */
           register()
 
         }
@@ -1106,7 +1145,6 @@ private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Lon
         override def postStop(): Unit = {
           if (hubCallback ne null)
             hubCallback.invoke(UnRegister(id))
-          //println(s"# consumer $id callbackCount $callbackCount") // FIXME
         }
 
         private def onCommand(cmd: ConsumerEvent): Unit = {
