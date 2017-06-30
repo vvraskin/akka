@@ -6,6 +6,7 @@ package akka.stream.javadsl
 import akka.NotUsed
 import java.util.function.Supplier
 import java.util.function.BiFunction
+import akka.annotation.DoNotInherit
 
 /**
  * A MergeHub is a special streaming hub that is able to collect streamed elements from a dynamic set of
@@ -125,28 +126,28 @@ object PartitionHub {
    *
    * @param partitioner Function that decides where to route an element. It is a factory of a function to
    *   to be able to hold stateful variables that are unique for each materialization. The function
-   *   takes two parameters; the first is an array of consumer identifiers and the second is the
-   *   stream element. The function should return the selected consumer identifier for the given
-   *   element. The function will never be called when there are no active consumers, i.e. there
-   *   is always at least one element in the array of identifiers.
+   *   takes two parameters; the first is information about active consumers, including an array of consumer
+   *   identifiers and the second is the stream element. The function should return the selected consumer
+   *   identifier for the given element. The function will never be called when there are no active consumers,
+   *   i.e. there is always at least one element in the array of identifiers.
    * @param startAfterNbrOfConsumers Elements are buffered until this number of consumers have been connected.
    *   This is only used initially when the stage is starting up, i.e. it is not honored when consumers have
    *   been removed (canceled).
    * @param bufferSize Total number of elements that can be buffered. If this buffer is full, the producer
    *   is backpressured.
    */
-  def ofStateful[T](clazz: Class[T], partitioner: Supplier[BiFunction[Array[Long], T, java.lang.Long]],
+  def ofStateful[T](clazz: Class[T], partitioner: Supplier[BiFunction[ConsumerInfo, T, java.lang.Long]],
                     startAfterNbrOfConsumers: Int, bufferSize: Int): Sink[T, Source[T, NotUsed]] = {
-    val p: () ⇒ (Array[Long], T) ⇒ Long = () ⇒ {
+    val p: () ⇒ (akka.stream.scaladsl.PartitionHub.ConsumerInfo, T) ⇒ Long = () ⇒ {
       val f = partitioner.get()
-      (ids, elem) ⇒ f.apply(ids, elem)
+      (info, elem) ⇒ f.apply(info, elem)
     }
     akka.stream.scaladsl.PartitionHub.statefulSink[T](p, startAfterNbrOfConsumers, bufferSize)
       .mapMaterializedValue(_.asJava)
       .asJava
   }
 
-  def ofStateful[T](clazz: Class[T], partitioner: Supplier[BiFunction[Array[Long], T, java.lang.Long]],
+  def ofStateful[T](clazz: Class[T], partitioner: Supplier[BiFunction[ConsumerInfo, T, java.lang.Long]],
                     startAfterNbrOfConsumers: Int): Sink[T, Source[T, NotUsed]] =
     ofStateful(clazz, partitioner, startAfterNbrOfConsumers, akka.stream.scaladsl.PartitionHub.defaultBufferSize)
 
@@ -188,4 +189,27 @@ object PartitionHub {
 
   def of[T](clazz: Class[T], partitioner: BiFunction[Integer, T, Integer], startAfterNbrOfConsumers: Int): Sink[T, Source[T, NotUsed]] =
     of(clazz, partitioner, startAfterNbrOfConsumers, akka.stream.scaladsl.PartitionHub.defaultBufferSize)
+
+  @DoNotInherit trait ConsumerInfo {
+
+    /**
+     * Identifiers of current consumers
+     */
+    def consumerIds: Array[Long]
+
+    /**
+     * Approximate number of buffered elements for a consumer.
+     * Larger value than other consumers could be an indication of
+     * that the consumer is slow.
+     *
+     * Note that this is a moving target since the elements are
+     * consumed concurrently.
+     */
+    def queueSize(consumerId: Long): Int
+
+    /**
+     * Number of attached consumers.
+     */
+    def size: Int
+  }
 }

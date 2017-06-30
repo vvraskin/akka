@@ -328,7 +328,7 @@ class HubSpec extends StreamSpec {
       downstream2.expectError(TE("Failed"))
     }
 
-    "properly singal completion to consumers arriving after producer finished" in assertAllStagesStopped {
+    "properly signal completion to consumers arriving after producer finished" in assertAllStagesStopped {
       val source = Source.empty[Int].runWith(BroadcastHub.sink(8))
       // Wait enough so the Hub gets the completion. This is racy, but this is fine because both
       // cases should work in the end
@@ -355,7 +355,7 @@ class HubSpec extends StreamSpec {
       sink2Probe.expectComplete()
     }
 
-    "properly singal error to consumers arriving after producer finished" in assertAllStagesStopped {
+    "properly signal error to consumers arriving after producer finished" in assertAllStagesStopped {
       val source = Source.failed(TE("Fail!")).runWith(BroadcastHub.sink(8))
       // Wait enough so the Hub gets the completion. This is racy, but this is fine because both
       // cases should work in the end
@@ -392,9 +392,9 @@ class HubSpec extends StreamSpec {
       val source = Source(0 until 10).runWith(PartitionHub.statefulSink(() ⇒ {
         var n = 0L
 
-        (ids, elem) ⇒ {
+        (info, elem) ⇒ {
           n += 1
-          ids((n % ids.length).toInt)
+          info.consumerIds((n % info.size).toInt)
         }
       }, startAfterNbrOfConsumers = 2, bufferSize = 8))
       // latch to make materialization order deterministic
@@ -411,12 +411,12 @@ class HubSpec extends StreamSpec {
         var sessions = Map.empty[String, Long]
         var n = 0L
 
-        (ids, elem) ⇒ {
+        (info, elem) ⇒ {
           sessions.get(elem) match {
-            case Some(id) if ids.exists(_ == id) ⇒ id
+            case Some(id) if info.consumerIds.exists(_ == id) ⇒ id
             case _ ⇒
               n += 1
-              val id = ids((n % ids.length).toInt)
+              val id = info.consumerIds((n % info.consumerIds.length).toInt)
               sessions = sessions.updated(elem, id)
               id
           }
@@ -429,6 +429,19 @@ class HubSpec extends StreamSpec {
       val result2 = source.runWith(Sink.seq)
       result1.futureValue should ===(List("usr-2"))
       result2.futureValue should ===(List("usr-1", "usr-1", "usr-3"))
+    }
+
+    "be able to use as fastest consumer router" in assertAllStagesStopped {
+      val source = Source(0 until 1000).runWith(PartitionHub.statefulSink(
+        () ⇒ (info, elem) ⇒ info.consumerIds.toVector.minBy(id ⇒ info.queueSize(id)),
+        startAfterNbrOfConsumers = 2, bufferSize = 4))
+      // latch to make materialization order deterministic
+      val latch = TestLatch(1)
+      val result1 = source.toMat(Sink.seq)(Keep.right).mapMaterializedValue(m ⇒ { latch.countDown(); m }).run()
+      Await.ready(latch, remainingOrDefault)
+      val result2 = source.throttle(10, 100.millis, 10, ThrottleMode.Shaping).runWith(Sink.seq)
+
+      result1.futureValue.size should be > (result2.futureValue.size)
     }
 
     "route evenly" in assertAllStagesStopped {
@@ -578,7 +591,7 @@ class HubSpec extends StreamSpec {
       downstream2.expectError(TE("Failed"))
     }
 
-    "properly singal completion to consumers arriving after producer finished" in assertAllStagesStopped {
+    "properly signal completion to consumers arriving after producer finished" in assertAllStagesStopped {
       val source = Source.empty[Int].runWith(PartitionHub.sink((size, elem) ⇒ elem % size, startAfterNbrOfConsumers = 0))
       // Wait enough so the Hub gets the completion. This is racy, but this is fine because both
       // cases should work in the end
@@ -606,7 +619,7 @@ class HubSpec extends StreamSpec {
       sink2Probe.expectComplete()
     }
 
-    "properly singal error to consumers arriving after producer finished" in assertAllStagesStopped {
+    "properly signal error to consumers arriving after producer finished" in assertAllStagesStopped {
       val source = Source.failed[Int](TE("Fail!")).runWith(
         PartitionHub.sink((size, elem) ⇒ 0, startAfterNbrOfConsumers = 0))
       // Wait enough so the Hub gets the failure. This is racy, but this is fine because both

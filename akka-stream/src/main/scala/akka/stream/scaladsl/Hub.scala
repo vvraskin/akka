@@ -20,6 +20,7 @@ import java.util.concurrent.atomic.AtomicReferenceArray
 import scala.collection.mutable.LongMap
 import scala.collection.immutable.Queue
 import akka.annotation.InternalApi
+import akka.annotation.DoNotInherit
 
 /**
  * A MergeHub is a special streaming hub that is able to collect streamed elements from a dynamic set of
@@ -736,17 +737,17 @@ object PartitionHub {
    *
    * @param partitioner Function that decides where to route an element. It is a factory of a function to
    *   to be able to hold stateful variables that are unique for each materialization. The function
-   *   takes two parameters; the first is an array of consumer identifiers and the second is the
-   *   stream element. The function should return the selected consumer identifier for the given
-   *   element. The function will never be called when there are no active consumers, i.e. there
-   *   is always at least one element in the array of identifiers.
+   *   takes two parameters; the first is information about active consumers, including an array of consumer
+   *   identifiers and the second is the stream element. The function should return the selected consumer
+   *   identifier for the given element. The function will never be called when there are no active consumers,
+   *   i.e. there is always at least one element in the array of identifiers.
    * @param startAfterNbrOfConsumers Elements are buffered until this number of consumers have been connected.
    *   This is only used initially when the stage is starting up, i.e. it is not honored when consumers have
    *   been removed (canceled).
    * @param bufferSize Total number of elements that can be buffered. If this buffer is full, the producer
    *   is backpressured.
    */
-  def statefulSink[T](partitioner: () ⇒ (Array[Long], T) ⇒ Long, startAfterNbrOfConsumers: Int,
+  def statefulSink[T](partitioner: () ⇒ (ConsumerInfo, T) ⇒ Long, startAfterNbrOfConsumers: Int,
                       bufferSize: Int = defaultBufferSize): Sink[T, Source[T, NotUsed]] =
     Sink.fromGraph(new PartitionHub[T](partitioner, startAfterNbrOfConsumers, bufferSize))
 
@@ -780,7 +781,30 @@ object PartitionHub {
    */
   def sink[T](partitioner: (Int, T) ⇒ Int, startAfterNbrOfConsumers: Int,
               bufferSize: Int = defaultBufferSize): Sink[T, Source[T, NotUsed]] =
-    statefulSink(() ⇒ (ids, elem) ⇒ ids(partitioner(ids.length, elem)), startAfterNbrOfConsumers, bufferSize)
+    statefulSink(() ⇒ (info, elem) ⇒ info.consumerIds(partitioner(info.size, elem)), startAfterNbrOfConsumers, bufferSize)
+
+  @DoNotInherit trait ConsumerInfo extends akka.stream.javadsl.PartitionHub.ConsumerInfo {
+
+    /**
+     * Identifiers of current consumers
+     */
+    def consumerIds: Array[Long]
+
+    /**
+     * Approximate number of buffered elements for a consumer.
+     * Larger value than other consumers could be an indication of
+     * that the consumer is slow.
+     *
+     * Note that this is a moving target since the elements are
+     * consumed concurrently.
+     */
+    def queueSize(consumerId: Long): Int
+
+    /**
+     * Number of attached consumers.
+     */
+    def size: Int
+  }
 
   /**
    * INTERNAL API
@@ -810,7 +834,8 @@ object PartitionHub {
     // queue in Artery
     trait PartitionQueue {
       def init(id: Long): Unit
-      def size: Int
+      def totalSize: Int
+      def size(id: Long): Int
       def isEmpty(id: Long): Boolean
       def nonEmpty(id: Long): Boolean
       def offer(id: Long, elem: Any): Unit
@@ -818,37 +843,64 @@ object PartitionHub {
       def remove(id: Long): Unit
     }
 
-    class PartitionQueueImpl extends PartitionQueue {
-      private val queues1 = new AtomicReferenceArray[Queue[Any]](FixedQueues)
-      private val queues2 = new ConcurrentHashMap[Long, Queue[Any]]
-      private val _size = new AtomicInteger
+    object ConsumerQueue {
+      val empty = ConsumerQueue(Queue.empty, 0)
+    }
 
-      def init(id: Long): Unit = {
+    final case class ConsumerQueue(queue: Queue[Any], size: Int) {
+      def enqueue(elem: Any): ConsumerQueue =
+        new ConsumerQueue(queue.enqueue(elem), size + 1)
+
+      def isEmpty: Boolean = size == 0
+
+      def head: Any = queue.head
+
+      def tail: ConsumerQueue =
+        new ConsumerQueue(queue.tail, size - 1)
+    }
+
+    class PartitionQueueImpl extends PartitionQueue {
+      private val queues1 = new AtomicReferenceArray[ConsumerQueue](FixedQueues)
+      private val queues2 = new ConcurrentHashMap[Long, ConsumerQueue]
+      private val _totalSize = new AtomicInteger
+
+      override def init(id: Long): Unit = {
         if (id < FixedQueues)
-          queues1.set(id.toInt, Queue.empty)
+          queues1.set(id.toInt, ConsumerQueue.empty)
         else
-          queues2.put(id, Queue.empty)
+          queues2.put(id, ConsumerQueue.empty)
       }
 
-      def size: Int = _size.get
+      override def totalSize: Int = _totalSize.get
 
-      def isEmpty(id: Long): Boolean = {
+      def size(id: Long): Int = {
         val queue =
           if (id < FixedQueues) queues1.get(id.toInt)
           else queues2.get(id)
+        if (queue eq null)
+          throw new IllegalArgumentException(s"Invalid stream identifier: $id")
+        queue.size
+      }
+
+      override def isEmpty(id: Long): Boolean = {
+        val queue =
+          if (id < FixedQueues) queues1.get(id.toInt)
+          else queues2.get(id)
+        if (queue eq null)
+          throw new IllegalArgumentException(s"Invalid stream identifier: $id")
         queue.isEmpty
       }
 
-      def nonEmpty(id: Long): Boolean = !isEmpty(id)
+      override def nonEmpty(id: Long): Boolean = !isEmpty(id)
 
-      def offer(id: Long, elem: Any): Unit = {
+      override def offer(id: Long, elem: Any): Unit = {
         @tailrec def offer1(): Unit = {
           val i = id.toInt
           val queue = queues1.get(i)
           if (queue eq null)
             throw new IllegalArgumentException(s"Invalid stream identifier: $id")
           if (queues1.compareAndSet(i, queue, queue.enqueue(elem)))
-            _size.incrementAndGet()
+            _totalSize.incrementAndGet()
           else
             offer1() // CAS failed, retry
         }
@@ -858,7 +910,7 @@ object PartitionHub {
           if (queue eq null)
             throw new IllegalArgumentException(s"Invalid stream identifier: $id")
           if (queues2.replace(id, queue, queue.enqueue(elem))) {
-            _size.incrementAndGet()
+            _totalSize.incrementAndGet()
           } else
             offer2() // CAS failed, retry
         }
@@ -866,13 +918,13 @@ object PartitionHub {
         if (id < FixedQueues) offer1() else offer2()
       }
 
-      def poll(id: Long): AnyRef = {
+      override def poll(id: Long): AnyRef = {
         @tailrec def poll1(): AnyRef = {
           val i = id.toInt
           val queue = queues1.get(i)
           if ((queue eq null) || queue.isEmpty) null
           else if (queues1.compareAndSet(i, queue, queue.tail)) {
-            _size.decrementAndGet()
+            _totalSize.decrementAndGet()
             queue.head.asInstanceOf[AnyRef]
           } else
             poll1() // CAS failed, try again
@@ -882,7 +934,7 @@ object PartitionHub {
           val queue = queues2.get(id)
           if ((queue eq null) || queue.isEmpty) null
           else if (queues2.replace(id, queue, queue.tail)) {
-            _size.decrementAndGet()
+            _totalSize.decrementAndGet()
             queue.head.asInstanceOf[AnyRef]
           } else
             poll2() // CAS failed, try again
@@ -891,11 +943,11 @@ object PartitionHub {
         if (id < FixedQueues) poll1() else poll2()
       }
 
-      def remove(id: Long): Unit = {
+      override def remove(id: Long): Unit = {
         (if (id < FixedQueues) queues1.getAndSet(id.toInt, null)
         else queues2.remove(id)) match {
           case null  ⇒
-          case queue ⇒ _size.addAndGet(-queue.size)
+          case queue ⇒ _totalSize.addAndGet(-queue.size)
         }
       }
 
@@ -906,9 +958,12 @@ object PartitionHub {
 /**
  * INTERNAL API
  */
-private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Long, startAfterNbrOfConsumers: Int, bufferSize: Int)
+private[akka] class PartitionHub[T](
+  partitioner:              () ⇒ (PartitionHub.ConsumerInfo, T) ⇒ Long,
+  startAfterNbrOfConsumers: Int, bufferSize: Int)
   extends GraphStageWithMaterializedValue[SinkShape[T], Source[T, NotUsed]] {
   import PartitionHub.Internal._
+  import PartitionHub.ConsumerInfo
 
   val in: Inlet[T] = Inlet("PartitionHub.in")
   override val shape: SinkShape[T] = SinkShape(in)
@@ -932,11 +987,19 @@ private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Lon
 
     private val queue = createQueue()
     private var pending = Vector.empty[T]
-    private var consumers: Vector[Consumer] = Vector.empty
+    private var consumerInfo: ConsumerInfoImpl = new ConsumerInfoImpl(Array.emptyLongArray, Vector.empty)
     private val needWakeup: LongMap[Consumer] = LongMap.empty
-    private var consumerIds: Array[Long] = Array.emptyLongArray
 
     private var callbackCount = 0L
+
+    private class ConsumerInfoImpl(override val consumerIds: Array[Long], val consumers: Vector[Consumer])
+      extends ConsumerInfo {
+
+      override def queueSize(consumerId: Long): Int =
+        queue.size(consumerId)
+
+      override def size: Int = consumerIds.length
+    }
 
     override def preStart(): Unit = {
       setKeepGoing(true)
@@ -951,15 +1014,15 @@ private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Lon
     }
 
     private def isFull: Boolean = {
-      (queue.size + pending.size) >= bufferSize
+      (queue.totalSize + pending.size) >= bufferSize
     }
 
     private def publish(elem: T): Unit = {
-      if (!initialized || consumers.isEmpty) {
+      if (!initialized || consumerInfo.consumers.isEmpty) {
         // will be published when first consumers are registered
         pending :+= elem
       } else {
-        val id = materializedPartitioner(consumerIds, elem)
+        val id = materializedPartitioner(consumerInfo, elem)
         queue.offer(id, elem)
         wakeup(id)
       }
@@ -975,10 +1038,10 @@ private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Lon
     }
 
     override def onUpstreamFinish(): Unit = {
-      if (consumers.isEmpty)
+      if (consumerInfo.consumers.isEmpty)
         completeStage()
       else {
-        consumers.foreach(c ⇒ complete(c.id))
+        consumerInfo.consumers.foreach(c ⇒ complete(c.id))
       }
     }
 
@@ -1009,12 +1072,12 @@ private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Lon
 
         case RegistrationPending ⇒
           state.getAndSet(noRegistrationsState).asInstanceOf[Open].registrations foreach { consumer ⇒
-            consumers :+= consumer
-            consumers = consumers.sortBy(_.id)
-            consumerIds :+= consumer.id
-            consumerIds.sorted
+            val newConsumers = (consumerInfo.consumers :+ consumer).sortBy(_.id)
+            val newConsumerIds = consumerInfo.consumerIds :+ consumer.id
+            Arrays.sort(newConsumerIds)
+            consumerInfo = new ConsumerInfoImpl(newConsumerIds, newConsumers)
             queue.init(consumer.id)
-            if (consumers.size >= startAfterNbrOfConsumers) {
+            if (newConsumers.size >= startAfterNbrOfConsumers) {
               initialized = true
             }
 
@@ -1029,10 +1092,11 @@ private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Lon
           }
 
         case UnRegister(id) ⇒
-          consumers = consumers.filterNot(_.id == id)
-          consumerIds = consumerIds.filterNot(_ == id)
+          val newConsumers = consumerInfo.consumers.filterNot(_.id == id)
+          val newConsumerIds = consumerInfo.consumerIds.filterNot(_ == id)
+          consumerInfo = new ConsumerInfoImpl(newConsumerIds, newConsumers)
           queue.remove(id)
-          if (consumers.isEmpty) {
+          if (newConsumers.isEmpty) {
             if (isClosed(in)) completeStage()
           } else
             tryPull()
@@ -1048,7 +1112,7 @@ private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Lon
       }
 
       // Notify registered consumers
-      consumers.foreach { consumer ⇒
+      consumerInfo.consumers.foreach { consumer ⇒
         consumer.callback.invoke(failMessage)
       }
       failStage(ex)
@@ -1075,7 +1139,7 @@ private[akka] class PartitionHub[T](partitioner: () ⇒ (Array[Long], T) ⇒ Lon
     def poll(id: Long, hubCallback: AsyncCallback[HubEvent]): AnyRef = {
       // try pull via async callback when half full
       // this is racy with other threads doing poll but doesn't matter
-      if (queue.size == DemandThreshold)
+      if (queue.totalSize == DemandThreshold)
         hubCallback.invoke(TryPull)
 
       queue.poll(id)

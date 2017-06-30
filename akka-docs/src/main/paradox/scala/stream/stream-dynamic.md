@@ -219,7 +219,19 @@ be able to hold the mutable variable. A new instance of `RoundRobin` is created 
 @@snip [HubDocTest.java]($code$/java/jdocs/stream/HubDocTest.java) { #partition-hub-stateful-function }
 @@@
 
-The function takes two parameters; the first is an array of consumer identifiers and the second is the
-stream element. The function should return the selected consumer identifier for the given element. 
-The function will never be called when there are no active consumers, i.e. there is always at least one 
-element in the array of identifiers.
+The function takes two parameters; the first is information about active consumers, including an array of 
+consumer identifiers and the second is the stream element. The function should return the selected consumer
+identifier for the given element. The function will never be called when there are no active consumers, i.e. 
+there is always at least one element in the array of identifiers.
+
+Another interesting type of routing is to prefer routing to the fastest consumers. The `ConsumerInfo`
+has an accessor `queueSize` that is approximate number of buffered elements for a consumer.
+Larger value than other consumers could be an indication of that the consumer is slow.
+Note that this is a moving target since the elements are consumed concurrently. Here is an example of
+a hub that routes to the consumer with least buffered elements:
+
+Scala
+:   @@snip [HubsDocSpec.scala]($code$/scala/docs/stream/HubsDocSpec.scala) { #partition-hub-fastest }
+
+Java
+:   @@snip [HubDocTest.java]($code$/java/jdocs/stream/HubDocTest.java) { #partition-hub-fastest }

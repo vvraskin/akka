@@ -10,6 +10,7 @@ import akka.testkit.AkkaSpec
 import docs.CompileOnlySpec
 
 import scala.concurrent.duration._
+import akka.stream.ThrottleMode
 
 class HubsDocSpec extends AkkaSpec with CompileOnlySpec {
   implicit val materializer = ActorMaterializer()
@@ -137,12 +138,12 @@ class HubsDocSpec extends AkkaSpec with CompileOnlySpec {
 
       // New instance of the partitioner function and its state is created
       // for each materialization of the PartitionHub.
-      def roundRobin(): (Array[Long], String) ⇒ Long = {
+      def roundRobin(): (PartitionHub.ConsumerInfo, String) ⇒ Long = {
         var i = -1L
 
-        (ids, elem) => {
+        (info, elem) => {
           i += 1
-          ids((i % ids.length).toInt)
+          info.consumerIds((i % info.size).toInt)
         }
       }
 
@@ -163,6 +164,25 @@ class HubsDocSpec extends AkkaSpec with CompileOnlySpec {
       fromProducer.runForeach(msg => println("consumer1: " + msg))
       fromProducer.runForeach(msg => println("consumer2: " + msg))
       //#partition-hub-stateful
+    }
+
+    "demonstrate creating a dynamic partition hub routing to fastest consumer" in compileOnlySpec {
+      //#partition-hub-fastest
+      val producer = Source(0 until 100)
+
+      // ConsumerInfo.queueSize is the approximate number of buffered elements for a consumer.
+      // Note that this is a moving target since the elements are consumed concurrently.
+      val runnableGraph: RunnableGraph[Source[Int, NotUsed]] =
+        producer.toMat(PartitionHub.statefulSink(
+          () => (info, elem) ⇒ info.consumerIds.toVector.minBy(id ⇒ info.queueSize(id)),
+          startAfterNbrOfConsumers = 2, bufferSize = 16))(Keep.right)
+
+      val fromProducer: Source[Int, NotUsed] = runnableGraph.run()
+
+      fromProducer.runForeach(msg => println("consumer1: " + msg))
+      fromProducer.throttle(10, 100.millis, 10, ThrottleMode.Shaping)
+        .runForeach(msg => println("consumer2: " + msg))
+      //#partition-hub-fastest
     }
 
   }
